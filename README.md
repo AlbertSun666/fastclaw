@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="web/public/brand/logo.svg" alt="FastClaw" width="120">
+
 # FastClaw
 
 A lightweight AI Agent runtime written in Go.
