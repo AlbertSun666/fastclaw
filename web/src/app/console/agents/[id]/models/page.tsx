@@ -173,19 +173,20 @@ export default function AgentModelsPage() {
 
   // Dropdown lists models from every scope the agent will resolve at
   // runtime — agent overrides shadow user, user overrides system. We
-  // dedupe on `provider/modelId` so a same-name override doesn't show
-  // twice; the lower-scope row wins (agent > user > system) because it's
-  // what would actually be chosen.
+  // replace same-name providers as a whole, including their model lists.
+  // An empty agent-level model list still shadows the inherited provider.
   const allModelOptions: { value: string; label: string }[] = useMemo(() => {
     const seen = new Set<string>();
+    const seenProviders = new Set<string>();
     const order: ProviderEntry["scope"][] = ["agent", "user", "system"];
     const out: { value: string; label: string }[] = [];
     for (const sc of order) {
       for (const p of providers) {
-        if (p.scope !== sc) continue;
+        if (p.scope !== sc || seenProviders.has(p.name)) continue;
+        seenProviders.add(p.name);
         for (const m of p.models) {
           const value = `${p.name}/${m.id}`;
-          if (seen.has(value)) continue;
+          if (!m.id || seen.has(value)) continue;
           seen.add(value);
           out.push({ value, label: `${p.name}/${m.name || m.id}` });
         }
