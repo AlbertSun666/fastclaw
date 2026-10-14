@@ -5,6 +5,46 @@ action on upgrade — read those notes before deploying.
 
 ## [Unreleased]
 
+### Changed — API streams the turn as it runs
+
+`stream: true` on `/v1/chat/completions` now runs the same agent loop as the
+web chat: the agent's text arrives as it is written, including what it says
+between steps, and each tool call is reported on a chunk with an empty
+delta and a top-level `tool` object (`{"id", "name", "status": "running" |
+"done"}`). The final answer costs one model call instead of two. Separate
+messages in a reply are joined by a blank line instead of a literal
+`<|split|>` marker.
+
+### Changed — failed API turns are errors
+
+When the agent's model API fails, or the model gives no usable answer, a
+non-streaming request now answers `502` with `{"error": {"code":
+"agent_error", ...}}` instead of a `200` apology, and a stream ends with
+that `error` object on its final chunk. Integrators that treated every
+`200` as a delivered answer should handle it (don't charge, offer a retry).
+The reason is also saved in the conversation, so the console shows why a
+turn failed.
+
+### Added — `/model` in `fastclaw chat`
+
+The terminal chat switches the current agent's model with
+`/model [provider/model|default]`, listing the same models as the console,
+and its footer keeps the key hints on one line.
+
+### Fixed
+
+- A reply cut off at the model's output limit (usually one huge tool call)
+  is dropped and retried with a note to work in smaller pieces, instead of
+  running half-written arguments or ending the turn empty.
+- DeepSeek thinking mode behind a routing model: a "reasoning_content must
+  be passed back" 400 is retried with it, and later calls send it up front.
+- Pictures in API conversations and project chats show in the console —
+  a reply's file links are resolved against the conversation's own folder.
+  Pictures the agent links instead of embedding are shown inline, and an
+  image beside text no longer causes a hydration error.
+- An agent's model dropdown no longer mixes in models from an inherited
+  provider of the same name.
+
 ### Added — connectors (Notion, GitHub, Linear, …)
 
 People connect their own accounts in Console → Connectors and agents they
