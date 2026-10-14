@@ -70,19 +70,25 @@ function agentWorkspacePath(url: string, agentId: string): { path: string; relat
 }
 
 // resolveWorkspaceUrl maps a URL the model wrote for a workspace file to its
-// path relative to the agent root (what fileUrl takes), or null when it isn't
-// one. Sandbox `/workspace/<name>` and host-mode relative paths are both
-// session-scoped (the docker bind-mount and the host exec cwd are the session
-// workspace); an absolute host path under workspaces/<agentId>/ is exact.
-function resolveWorkspaceUrl(url: string, agentId: string, sessionId?: string): string | null {
-  const scoped = (rel: string) => (sessionId ? `sessions/${sessionId}/${rel}` : rel);
+// path relative to the agent root (what the file viewer takes) and the URL
+// that serves it, or null when it isn't one. Sandbox `/workspace/<name>` and
+// host-mode relative paths are both session-scoped (the docker bind-mount and
+// the host exec cwd are the session workspace), so the server resolves them
+// against the session's folder; an absolute host path under
+// workspaces/<agentId>/ is exact.
+function resolveWorkspaceUrl(url: string, agentId: string, sessionId?: string): { path: string; url: string } | null {
+  const scoped = (rel: string) => sessionId
+    ? { path: `sessions/${sessionId}/${rel}`, url: fileUrl(agentId, rel, false, sessionId) }
+    : { path: rel, url: fileUrl(agentId, rel) };
   if (url.startsWith("/workspace/")) return scoped(url.slice("/workspace/".length));
   const target = agentWorkspacePath(url, agentId);
   if (!target) return null;
-  return target.relative ? scoped(target.path) : target.path;
+  return target.relative ? scoped(target.path) : { path: target.path, url: fileUrl(agentId, target.path) };
 }
 
-type RehypePlugins = NonNullable<ComponentProps<typeof Streamdown>["rehypePlugins"]>;
+const IMAGE_PATH_RE = /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i;
+
+type RehypePlugins =NonNullable<ComponentProps<typeof Streamdown>["rehypePlugins"]>;
 
 type HastNode = { type?: string; tagName?: string; properties?: Record<string, unknown>; children?: HastNode[] };
 
@@ -93,19 +99,47 @@ type HastNode = { type?: string; tagName?: string; properties?: Record<string, u
 // such links rendered as "report.html [blocked]".
 function rehypeWorkspaceUrls(options: { agentId: string; sessionId?: string }) {
   return (tree: HastNode) => {
+    // Pictures the reply already embeds, so a link to one stays a link.
+    const embedded = new Set<string>();
+    const collect = (node: HastNode) => {
+      const src = node.tagName === "img" ? node.properties?.src : undefined;
+      const target = typeof src === "string" ? resolveWorkspaceUrl(src, options.agentId, options.sessionId) : null;
+      if (target) embedded.add(target.path);
+      node.children?.forEach(collect);
+    };
+    collect(tree);
     const walk = (node: HastNode) => {
       if (node.type === "element" && node.properties) {
         const attr = node.tagName === "img" ? "src" : node.tagName === "a" ? "href" : "";
         const value = attr ? node.properties[attr] : undefined;
         if (typeof value === "string") {
-          const rel = resolveWorkspaceUrl(value, options.agentId, options.sessionId);
-          if (rel) {
-            node.properties[attr] = fileUrl(options.agentId, rel);
+          const target = resolveWorkspaceUrl(value, options.agentId, options.sessionId);
+          if (target) {
+            const { path: rel, url } = target;
+            // Models often link a picture they made ([cat.png](cat.png))
+            // instead of embedding it; show the picture itself. A link that
+            // wraps other markup (e.g. an image) is left alone.
+            if (attr === "href" && IMAGE_PATH_RE.test(rel) && !embedded.has(rel) && node.children?.every((c) => c.type === "text")) {
+              embedded.add(rel);
+              const alt = node.children.map((c) => (c as { value?: string }).value ?? "").join("");
+              node.tagName = "img";
+              node.properties = { src: url, alt };
+              node.children = [];
+              return;
+            }
+            node.properties[attr] = url;
             if (attr === "href") node.properties.dataWorkspacePath = rel;
           }
         }
       }
       node.children?.forEach(walk);
+      // Streamdown wraps each image in a <div>, and only unwraps a paragraph
+      // whose sole child is the image; text beside it ("Here: ![](a.png)")
+      // would leave a <div> inside <p>, which is invalid HTML.
+      if (node.type === "element" && node.tagName === "p" && node.children?.some((c) => c.type === "element" && c.tagName === "img")) {
+        node.tagName = "div";
+        node.properties = { ...node.properties, className: "my-1.5" };
+      }
     };
     walk(tree);
   };

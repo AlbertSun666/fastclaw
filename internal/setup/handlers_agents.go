@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -1408,6 +1409,28 @@ func (s *Server) handleAgentFile(w http.ResponseWriter, r *http.Request) {
 	}
 	if !s.requireAgentReadable(w, r, id) {
 		return
+	}
+	// ?sessionId= makes the path relative to that conversation's folder,
+	// resolved like the file panel's (sessions/<chat id>/ or
+	// projects/<pid>/<chat id>/): a reply's relative file links only know
+	// the session, and an API conversation's folder is named by the
+	// caller's conversation key, not the session id.
+	if sid := r.URL.Query().Get("sessionId"); sid != "" {
+		clean := path.Clean("/" + rel)[1:]
+		if clean == "" || clean != strings.TrimPrefix(rel, "./") {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "invalid path"})
+			return
+		}
+		projectID, chatID, ok := s.workspaceFolderScope(r, id, sid, "")
+		if !ok || chatID == "" {
+			jsonResponse(w, http.StatusNotFound, map[string]any{"error": "session not found"})
+			return
+		}
+		if projectID != "" {
+			rel = "projects/" + projectID + "/" + chatID + "/" + clean
+		} else {
+			rel = "sessions/" + chatID + "/" + clean
+		}
 	}
 	// Never serve a file named SKILL.md as a downloadable artifact. Skill
 	// manifests are the agent's IP and never legitimately land in the

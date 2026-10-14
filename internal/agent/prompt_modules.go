@@ -722,9 +722,10 @@ Then in your final reply, write: ![](/workspace/output.png)`
 // The web chat resolves paths relative to the Working Directory (and
 // absolute paths under it) to the file API; anything else is blocked.
 const hostMediaNote = `# Showing files in chat
-To show an image (or link a file) you produced, save it inside the Working
-Directory and reference it by its path relative to that directory, e.g.
-![chart](chart.png) or [report](reports/q3.md). Copy files that were
+To show an image you produced, embed it with image syntax and its path
+relative to the Working Directory, e.g. ![chart](chart.png) — the picture
+appears inline in the chat. Link other files the same way, e.g.
+[report](reports/q3.md). Copy files that were
 written elsewhere (another tool's cache, /tmp, Downloads) into the Working
 Directory first — paths outside it cannot be displayed.`
 

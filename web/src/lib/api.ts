@@ -2425,9 +2425,12 @@ export async function getAgentTokenUsage(
 // cookie, so <img src>, <a href>, and direct downloads authenticate by cookie
 // like every other API call. (Putting `?token=<bearer>` in a URL leaked a full
 // API credential via Referer, browser history, and reverse-proxy access logs.)
-export function fileUrl(agentId: string, path: string, download = false): string {
+// With sessionId, path is relative to that conversation's folder and the
+// server resolves where the folder is.
+export function fileUrl(agentId: string, path: string, download = false, sessionId?: string): string {
   const encoded = path.split("/").map(encodeURIComponent).join("/");
   const params = new URLSearchParams();
+  if (sessionId) params.set("sessionId", sessionId);
   if (download) params.set("download", "1");
   const qs = params.toString();
   return `/api/agents/${agentId}/files/${encoded}${qs ? "?" + qs : ""}`;
