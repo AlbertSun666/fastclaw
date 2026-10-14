@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fastclaw-ai/fastclaw/internal/replytext"
 	"github.com/muesli/reflow/wordwrap"
 )
 
@@ -63,6 +64,11 @@ func renderUserBlock(content string, width int) string {
 }
 
 func renderAssistantBlock(content string, width int) string {
+	return renderAssistantText(content, width, false)
+}
+
+func renderAssistantText(content string, width int, streaming bool) string {
+	content = strings.Join(replytext.Split(content, streaming), "\n\n")
 	if content == "" {
 		return ""
 	}

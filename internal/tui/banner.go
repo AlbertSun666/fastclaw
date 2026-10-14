@@ -1,45 +1,20 @@
 package tui
 
-import "strings"
+import "github.com/charmbracelet/lipgloss"
 
-// bannerLines is "FASTCLAW" in the ANSI Shadow figlet font, matching
-// the codeany wordmark style.
-var bannerLines = []string{
-	"███████╗ █████╗ ███████╗████████╗ ██████╗██╗      █████╗ ██╗    ██╗",
-	"██╔════╝██╔══██╗██╔════╝╚══██╔══╝██╔════╝██║     ██╔══██╗██║    ██║",
-	"█████╗  ███████║███████╗   ██║   ██║     ██║     ███████║██║ █╗ ██║",
-	"██╔══╝  ██╔══██║╚════██║   ██║   ██║     ██║     ██╔══██║██║███╗██║",
-	"██║     ██║  ██║███████║   ██║   ╚██████╗███████╗██║  ██║╚███╔███╔╝",
-	"╚═╝     ╚═╝  ╚═╝╚══════╝   ╚═╝    ╚═════╝╚══════╝╚═╝  ╚═╝ ╚══╝╚══╝ ",
-}
-
-// bannerIndent is the left padding applied to every wordmark row.
-const bannerIndent = "    "
-
-// renderBanner draws the FASTCLAW wordmark. Returns "" when the
-// terminal is too narrow to fit it, letting the caller fall back to a
-// plain one-line title.
-func renderBanner(width int) string {
-	if width > 0 && width < len([]rune(bannerLines[0]))+len(bannerIndent)+1 {
-		return ""
+// Keep the persistent hints to a single row, including in narrow panes.
+func (m *Model) renderFooter() string {
+	if m.modelBusy {
+		return "  " + styleMuted.Render("Updating model selection…")
 	}
-	var b strings.Builder
-	for i, line := range bannerLines {
-		if i > 0 {
-			b.WriteString("\n")
-		}
-		b.WriteString(stylePrimary.Render(bannerIndent + line))
+	hints := "/help commands"
+	if m.width >= 68 {
+		hints = "/agents switch agent · /help commands · Ctrl+J newline"
+	} else if m.width >= 42 {
+		hints = "/agents switch agent · /help commands"
 	}
-	return b.String()
-}
-
-// renderTips lists the key bindings shown inside the welcome box.
-func renderTips() string {
-	pair := func(key, desc string) string {
-		return styleDim.Render(key) + styleMuted.Render(" "+desc)
+	if m.querying {
+		hints = "Ctrl+C interrupt · Esc detach"
 	}
-	return pair("Enter", "send") + pair("  Ctrl+J", "newline") + pair("  /help", "commands") +
-		"\n" +
-		pair("Ctrl+C", "interrupt") + pair("  Esc", "detach") +
-		pair("  Ctrl+L", "clear") + pair("  !cmd", "shell")
+	return "  " + styleMuted.Render(lipgloss.NewStyle().MaxWidth(max(m.width-4, 1)).Render(hints))
 }

@@ -13,6 +13,11 @@ import (
 
 type fakeClient struct{}
 
+func (fakeClient) Models(context.Context, string) (cliclient.ModelCatalog, error) {
+	return cliclient.ModelCatalog{Current: "claude", Options: []cliclient.ModelOption{{ID: "test/model"}}}, nil
+}
+func (fakeClient) SetAgentModel(context.Context, string, string) error { return nil }
+
 func (fakeClient) Agents(context.Context) ([]cliclient.Agent, error) { return nil, nil }
 func (fakeClient) Sessions(context.Context, string) ([]cliclient.Session, error) {
 	return nil, nil
@@ -41,17 +46,17 @@ func newTestModel() *Model {
 	return m
 }
 
-func TestStatusBarOnlyShowsModelAndWorkingDirectory(t *testing.T) {
+func TestStatusBarShowsAgentModelAndWorkingDirectory(t *testing.T) {
 	m := newTestModel()
 	m.querying = true
 	m.queued = []string{"next"}
 	m.pendingImages = []string{"data:image/png;base64,eA=="}
 
 	got := plain(m.renderStatusBar())
-	if !strings.Contains(got, "claude") || !strings.Contains(got, "/work/fastclaw") {
-		t.Fatalf("status bar missing model or cwd: %q", got)
+	if !strings.Contains(got, "Coder · claude · /work/fastclaw") {
+		t.Fatalf("status bar missing agent, model or cwd: %q", got)
 	}
-	for _, unwanted := range []string{"replying", "Coder", "127.0.0.1", "cli-test", "queued", "image"} {
+	for _, unwanted := range []string{"replying", "127.0.0.1", "cli-test", "queued", "image"} {
 		if strings.Contains(got, unwanted) {
 			t.Fatalf("status bar contains %q: %q", unwanted, got)
 		}
@@ -334,36 +339,75 @@ func TestHelpTextListsCommands(t *testing.T) {
 	}
 }
 
-func TestWelcomeRendersBannerAndSessionInfo(t *testing.T) {
+func TestWelcomeRendersCompactSessionInfo(t *testing.T) {
 	m := newTestModel()
 	m.opts.Version = "v1.2.3"
-
-	welcome := m.renderWelcome()
-	for _, want := range []string{
-		bannerLines[0],
-		"AI agents factory",
-		"v1.2.3",
-		"agent  Coder",
-		"model  claude",
-		"web    http://127.0.0.1:18953",
-		"Ctrl+J",
-		"!cmd",
-	} {
+	welcome := plain(m.renderWelcome())
+	for _, want := range []string{">_ FastClaw (v1.2.3)", "/work/fastclaw", "agent: Coder"} {
 		if !strings.Contains(welcome, want) {
-			t.Fatalf("welcome screen missing %q:\n%s", want, welcome)
+			t.Fatalf("welcome missing %q:\n%s", want, welcome)
 		}
 	}
 }
 
-func TestWelcomeFallsBackToCompactTitleInNarrowTerminal(t *testing.T) {
+func TestWelcomeAndFooterFitNarrowTerminal(t *testing.T) {
 	m := newTestModel()
-	m.width = 40
-
-	welcome := m.renderWelcome()
-	if strings.Contains(welcome, bannerLines[0]) {
-		t.Fatalf("narrow welcome unexpectedly rendered the wide banner:\n%s", welcome)
+	m.agent.Model = strings.Repeat("long-model-", 10)
+	m.agent.Name = strings.Repeat("智能助手", 10)
+	for _, width := range []int{20, 40, 80} {
+		m.width = width
+		for _, view := range []string{m.renderWelcome(), m.renderStatusBar(), m.renderFooter()} {
+			for _, line := range strings.Split(view, "\n") {
+				if lipgloss.Width(line) > width {
+					t.Fatalf("line exceeds width %d: %q", width, line)
+				}
+			}
+		}
 	}
-	if !strings.Contains(welcome, "● FastClaw") {
-		t.Fatalf("narrow welcome missing compact title:\n%s", welcome)
+}
+
+func TestEmptyWelcomeFrameFitsTerminal(t *testing.T) {
+	m := newTestModel()
+	for _, height := range []int{12, 24, 40} {
+		m.height = height
+		m.input.SetWidth(m.width)
+		view := m.View()
+		if got := lipgloss.Height(m.renderWelcome()) + lipgloss.Height(view); got >= height {
+			t.Fatalf("welcome and input use %d rows in a %d-row terminal", got, height)
+		}
+		if strings.Count(plain(view), "Ask FastClaw to do anything") != 1 {
+			t.Fatalf("expected a single composer: %q", plain(view))
+		}
+	}
+}
+
+func TestAssistantSplitMarkersInLiveAndHistory(t *testing.T) {
+	m := newTestModel()
+	m.querying = true
+	for _, delta := range []string{"First", "<|", "split", "|>", "Second"} {
+		m.handleStreamEvent(evt("content_delta", "delta", delta))
+		if got := plain(m.renderLive()); strings.Contains(got, "<|") || strings.Contains(got, "split") {
+			t.Fatalf("streaming marker leaked: %q", got)
+		}
+	}
+	m.handleStreamEvent(evt("content"))
+	for _, block := range []displayBlock{m.blocks[0], {Kind: blockAssistant, Content: "First\n<|split|>\nSecond"}} {
+		got := plain(m.renderBlock(block))
+		if strings.Contains(got, "<|split|>") || !strings.Contains(got, "First") || !strings.Contains(got, "Second") {
+			t.Fatalf("invalid assistant display: %q", got)
+		}
+	}
+	if got := renderUserBlock("<|split|>", 80); !strings.Contains(got, "<|split|>") {
+		t.Fatal("user text changed")
+	}
+}
+
+func TestStatusBarTracksAgentSwitchAndDefaultModel(t *testing.T) {
+	m := newTestModel()
+	m.agents = []cliclient.Agent{{ID: "ship", Name: "ShipAny"}}
+	m.applyPickerChoice(pickerAgents, pickerItem{ID: "ship"})
+	got := plain(m.renderStatusBar())
+	if !strings.Contains(got, "ShipAny · default model · /work/fastclaw") || strings.Contains(got, "Coder") {
+		t.Fatalf("status bar did not follow selected agent: %q", got)
 	}
 }

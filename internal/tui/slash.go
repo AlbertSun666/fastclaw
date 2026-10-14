@@ -10,6 +10,7 @@ type slashCommand struct {
 }
 
 var slashCommands = []slashCommand{
+	{Name: "/model", Description: "Switch model for this agent: /model [provider/model|default]"},
 	{Name: "/new", Description: "Start a new session"},
 	{Name: "/sessions", Aliases: []string{"/resume"}, Description: "Browse and switch sessions"},
 	{Name: "/agents", Aliases: []string{"/agent"}, Description: "Switch agent"},

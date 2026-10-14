@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/fastclaw-ai/fastclaw/internal/cliclient"
 )
@@ -19,6 +20,8 @@ import (
 // Client is the slice of cliclient.Client the TUI consumes; an
 // interface so tests can fake the gateway.
 type Client interface {
+	Models(context.Context, string) (cliclient.ModelCatalog, error)
+	SetAgentModel(context.Context, string, string) error
 	Agents(ctx context.Context) ([]cliclient.Agent, error)
 	Sessions(ctx context.Context, agentID string) ([]cliclient.Session, error)
 	History(ctx context.Context, agentID, sessionID string) ([]cliclient.HistoryMessage, error)
@@ -75,6 +78,7 @@ const (
 	pickerNone pickerKind = iota
 	pickerSessions
 	pickerAgents
+	pickerModels
 )
 
 // Model is the Bubble Tea model for fastclaw chat.
@@ -128,8 +132,9 @@ type Model struct {
 	// Slash autocomplete.
 	slashMatches []slashCommand
 
-	errMsg   string
-	ctrlCArm time.Time
+	modelBusy bool
+	errMsg    string
+	ctrlCArm  time.Time
 }
 
 // NewModel builds the chat model. Call SetProgram before Run.
@@ -214,6 +219,12 @@ func (m *Model) drainPending() {
 
 func (m *Model) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case modelsMsg:
+		m.showModels(msg)
+		return m, nil
+	case modelChangedMsg:
+		m.modelChanged(msg)
+		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 
@@ -410,6 +421,10 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	if key == "enter" && m.modelBusy {
+		m.errMsg = "Updating model selection; please wait"
+		return m, nil
+	}
 	submitted, cmd := m.input.Update(msg)
 	if key == "enter" && len(m.pendingImages) > 0 {
 		submitted = true
@@ -477,6 +492,8 @@ func (m *Model) updateSlashMatches() {
 
 func (m *Model) handleSlash(name, args string) (tea.Model, tea.Cmd) {
 	switch name {
+	case "/model":
+		return m.modelCommand(args)
 	case "/help":
 		m.appendSystem(helpText(), false)
 
@@ -547,6 +564,8 @@ func (m *Model) handleSlash(name, args string) (tea.Model, tea.Cmd) {
 
 func (m *Model) applyPickerChoice(kind pickerKind, it pickerItem) (tea.Model, tea.Cmd) {
 	switch kind {
+	case pickerModels:
+		return m, m.setModelCmd(it.ID)
 	case pickerSessions:
 		m.sessionID = it.ID
 		m.sessionTitle = it.Title
@@ -751,7 +770,7 @@ func (m *Model) appendSystem(content string, isErr bool) {
 // liveHeight caps the redrawn region so the frame always fits: anything
 // taller than this has to reach the user through scrollback instead.
 func (m *Model) liveHeight() int {
-	return max(m.height-m.input.Height()-5, 4)
+	return max(m.height-m.input.Height()-6, 4)
 }
 
 // sync commits every block that has reached its final form to
@@ -817,7 +836,7 @@ func (m *Model) renderLive() string {
 	}
 	if m.querying {
 		if text := m.streamed.String(); strings.TrimSpace(text) != "" {
-			b.WriteString(renderAssistantBlock(text, m.width))
+			b.WriteString(renderAssistantText(text, m.width, true))
 		}
 	}
 	out := strings.TrimRight(b.String(), "\n")
@@ -839,28 +858,14 @@ func (m *Model) resetTranscript() {
 }
 
 func (m *Model) renderWelcome() string {
-	var b strings.Builder
-	b.WriteString("\n")
-	if art := renderBanner(m.width); art != "" {
-		b.WriteString(art + "\n\n")
-	} else {
-		b.WriteString("    " + stylePrimary.Bold(true).Render("● FastClaw") + "\n\n")
-	}
-	b.WriteString("    " + styleMuted.Render("AI agents factory"))
+	width := max(m.width-4, 1)
+	title := styleAccent.Bold(true).Render(">_ ") + styleText.Bold(true).Render("FastClaw")
 	if v := m.opts.Version; v != "" {
-		b.WriteString("  " + styleDim.Render(v))
+		title += styleMuted.Render(" (" + v + ")")
 	}
-	b.WriteString("\n\n")
-
-	b.WriteString("    " + styleMuted.Render("agent  "+m.agent.Name) + "\n")
-	if m.agent.Model != "" {
-		b.WriteString("    " + styleMuted.Render("model  "+m.agent.Model) + "\n")
-	}
-	b.WriteString("    " + styleMuted.Render("web    "+m.client.BaseURL()) + "\n\n")
-
-	b.WriteString(styleTipBox.Render(renderTips()))
-	b.WriteString("\n")
-	return b.String()
+	return "\n  " + ansi.Truncate(title, width, "…") + "\n" +
+		"     " + styleMuted.Render(truncatePathLeft(m.workingDir, max(m.width-6, 1))) + "\n" +
+		"  " + ansi.Truncate(styleMuted.Render("agent: ")+styleText.Render(m.agent.Name), width, "…") + "\n"
 }
 
 func (m *Model) renderActivity() string {
@@ -898,17 +903,29 @@ func (m *Model) renderSlashSuggestions() string {
 	return stylePickerBox.Render(inner.String()) + "\n"
 }
 
-// renderStatusBar deliberately stays stable and sparse: the model explains
-// what is answering, while the working directory explains where it operates.
+// renderStatusBar identifies the selected agent, its configured model, and
+// the working directory. An empty model means the agent inherits its default.
 func (m *Model) renderStatusBar() string {
+	agent := strings.TrimSpace(m.agent.Name)
+	if agent == "" {
+		agent = m.agent.ID
+	}
+	if agent == "" {
+		agent = "Agent"
+	}
 	model := strings.TrimSpace(m.agent.Model)
 	if model == "" {
-		model = "default"
+		model = "default model"
 	}
-	separator := " │ "
-	available := max(m.width-1-lipgloss.Width(model)-lipgloss.Width(separator), 4)
-	dir := truncatePathLeft(m.workingDir, available)
-	return " " + styleMuted.Render(model) + styleDim.Render(separator+dir)
+	width := max(m.width-4, 1)
+	separator := " · "
+	// Reserve space for all three fields, even in narrow terminal panes.
+	available := max(width-2*lipgloss.Width(separator), 3)
+	agent = ansi.Truncate(agent, max(available/3, 1), "…")
+	model = ansi.Truncate(model, max((available-lipgloss.Width(agent))/2, 1), "…")
+	dir := truncatePathLeft(m.workingDir, max(available-lipgloss.Width(agent)-lipgloss.Width(model), 1))
+	return "  " + styleText.Bold(true).Render(agent) + styleMuted.Render(separator) +
+		stylePrimary.Render(model) + styleMuted.Render(separator) + styleText.Render(dir)
 }
 
 func compactWorkingDir(dir string) string {
@@ -967,5 +984,14 @@ func (m *Model) View() string {
 		b.WriteString("\n")
 	}
 	b.WriteString(m.renderStatusBar())
-	return b.String()
+	b.WriteString("\n" + m.renderFooter())
+	frame := b.String()
+	// Leave breathing room on the empty welcome screen, while retaining
+	// native scrollback once the conversation begins.
+	if len(m.blocks) == 0 && !m.querying && !m.opts.LoadHistory {
+		welcomeHeight := lipgloss.Height(m.renderWelcome())
+		padding := max(m.height-welcomeHeight-lipgloss.Height(frame)-1, 0)
+		frame = strings.Repeat("\n", padding) + frame
+	}
+	return frame
 }

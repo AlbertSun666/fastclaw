@@ -26,7 +26,7 @@ type inputModel struct {
 
 func newInputModel() *inputModel {
 	ta := textarea.New()
-	ta.Placeholder = "Send message"
+	ta.Placeholder = "Ask FastClaw to do anything"
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
 	ta.MaxHeight = 10
@@ -34,8 +34,9 @@ func newInputModel() *inputModel {
 	ta.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	ta.FocusedStyle.Base = lipgloss.NewStyle()
 	ta.BlurredStyle.Base = lipgloss.NewStyle()
-	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colDim)
-	ta.FocusedStyle.Prompt = lipgloss.NewStyle().Foreground(colPrimary).Bold(true)
+	ta.FocusedStyle.Placeholder = lipgloss.NewStyle().Foreground(colMuted)
+	ta.BlurredStyle.Placeholder = ta.FocusedStyle.Placeholder
+	ta.FocusedStyle.Prompt = lipgloss.NewStyle().Foreground(colText).Bold(true)
 	ta.BlurredStyle.Prompt = lipgloss.NewStyle().Foreground(colDim)
 	ta.Prompt = "› "
 	ta.Focus()
