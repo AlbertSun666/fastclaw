@@ -449,6 +449,9 @@ type anthropicMessageStart struct {
 }
 
 type anthropicMessageDelta struct {
+	Delta struct {
+		StopReason string `json:"stop_reason"`
+	} `json:"delta"`
 	Usage anthropicUsage `json:"usage"`
 }
 
@@ -509,6 +512,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 		}
 		blocks := make(map[int]*blockState)
 		var usage Usage
+		truncated := false
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -532,8 +536,11 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 				}
 			case "message_delta":
 				var md anthropicMessageDelta
-				if json.Unmarshal([]byte(data), &md) == nil && md.Usage.OutputTokens > 0 {
-					usage.OutputTokens = md.Usage.OutputTokens
+				if json.Unmarshal([]byte(data), &md) == nil {
+					if md.Usage.OutputTokens > 0 {
+						usage.OutputTokens = md.Usage.OutputTokens
+					}
+					truncated = truncated || md.Delta.StopReason == "max_tokens"
 				}
 			case "content_block_start":
 				var cbs anthropicContentBlockStart
@@ -613,6 +620,7 @@ func (p *AnthropicProvider) ChatStream(ctx context.Context, messages []Message, 
 					ThinkingSignature: thinkingSig,
 					Usage:             usage,
 					Done:              true,
+					Truncated:         truncated,
 				}:
 				case <-ctx.Done():
 				}
@@ -644,6 +652,7 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 	}
 	blocks := make(map[int]*blockState)
 	var usage Usage
+	truncated := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -668,8 +677,11 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 			}
 		case "message_delta":
 			var md anthropicMessageDelta
-			if json.Unmarshal([]byte(data), &md) == nil && md.Usage.OutputTokens > 0 {
-				usage.OutputTokens = md.Usage.OutputTokens
+			if json.Unmarshal([]byte(data), &md) == nil {
+				if md.Usage.OutputTokens > 0 {
+					usage.OutputTokens = md.Usage.OutputTokens
+				}
+				truncated = truncated || md.Delta.StopReason == "max_tokens"
 			}
 		case "content_block_start":
 			var cbs anthropicContentBlockStart
@@ -715,8 +727,9 @@ func (p *AnthropicProvider) parseSSE(body io.Reader) (*Response, error) {
 	}
 
 	result := &Response{
-		Content: contentBuilder.String(),
-		Usage:   usage,
+		Content:   contentBuilder.String(),
+		Usage:     usage,
+		Truncated: truncated,
 	}
 	var thinkingBuilder strings.Builder
 	var thinkingSig string

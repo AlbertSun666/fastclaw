@@ -192,6 +192,10 @@ type Response struct {
 	Thinking     string          // model's reasoning/thinking content (extracted for memory)
 	Usage        Usage           // token counts for metering (zero when provider didn't report)
 	RawAssistant json.RawMessage // exact API response message JSON (for cache-safe replay)
+	// Truncated is set when the model stopped at the output token limit
+	// (OpenAI finish_reason "length", Anthropic stop_reason "max_tokens"):
+	// the text and any tool call's arguments may be cut off.
+	Truncated bool
 }
 
 // HasToolCalls returns true if the response contains tool calls.
@@ -221,6 +225,9 @@ type StreamChunk struct {
 	// thinking mode) sees the correct top-level `reasoning_content` on
 	// replay, which it does not auto-generate.
 	RawAssistant json.RawMessage
+	// Truncated is set on the final (Done) chunk when the model stopped
+	// at the output token limit; see Response.Truncated.
+	Truncated bool
 }
 
 // StreamReader reads streaming chunks from an LLM response.

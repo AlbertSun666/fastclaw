@@ -821,6 +821,7 @@ func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []
 	var (
 		contentBuilder strings.Builder
 		toolCalls      []provider.ToolCall
+		truncated      bool
 		thinking       string
 		thinkingSig    string
 		rawAssistant   json.RawMessage
@@ -847,6 +848,7 @@ func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []
 		}
 		if chunk.Done {
 			toolCalls = chunk.ToolCalls
+			truncated = chunk.Truncated
 			if chunk.Thinking != "" {
 				thinking = chunk.Thinking
 			}
@@ -884,6 +886,7 @@ func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []
 		Thinking:     thinking,
 		Usage:        streamUsage,
 		RawAssistant: rawAssistant,
+		Truncated:    truncated,
 	}, nil
 }
 
@@ -2588,6 +2591,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	// channels.SplitMessageMarker at return time; manager.dispatchOutbound
 	// splits on it (AllowSplit=true) or collapses to newlines otherwise.
 	var replyParts []string
+	outputLimitRetries := 0
 
 	stop := turnStop{reason: stopReasonCap, limit: a.toolIterationLimit()}
 	loopWarned := false
@@ -2686,6 +2690,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			}
 			slog.Error("LLM chat failed after retries", "agent", a.name, "error", err)
 			fallback := buildFallbackReply(err, replyParts, streakState.lastFailedTool, streakState.lastFailureText)
+			a.recordTurnFailure(sess, fallback)
 			emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": err.Error()}})
 			emitEvent(ctx, ChatEvent{Type: "done"})
 			return fallback
@@ -2693,9 +2698,26 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
 
+		// A reply cut off at the output limit (typically one huge tool
+		// call) is dropped and the model asked again to work in smaller
+		// pieces, instead of running half-written arguments or ending
+		// the turn on an empty reply.
+		if cutOffAtOutputLimit(resp) && outputLimitRetries < maxOutputLimitRetries {
+			outputLimitRetries++
+			slog.Warn("model reply cut off at the output limit — retrying",
+				"agent", a.name, "max_tokens", a.maxTokens, "tool_calls", len(resp.ToolCalls), "retry", outputLimitRetries)
+			messages = append(messages, outputLimitMessage(a.maxTokens))
+			i-- // the dropped reply doesn't use up a tool round
+			continue
+		}
+
 		if !resp.HasToolCalls() {
 			if strings.TrimSpace(resp.Content) == "" {
 				emptyMsg := "model returned an empty response"
+				if resp.Truncated {
+					emptyMsg = "the model's reply was cut off at its output limit before it produced anything usable"
+				}
+				a.recordTurnFailure(sess, emptyMsg)
 				emitEvent(ctx, ChatEvent{Type: "error", Data: map[string]any{"message": emptyMsg}})
 				emitEvent(ctx, ChatEvent{Type: "done"})
 				return emptyMsg

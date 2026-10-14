@@ -1,7 +1,11 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -40,5 +44,46 @@ func TestToAPIMessagesEchoesEmptyReasoning(t *testing.T) {
 	json.Unmarshal(toAPIMessages(plain, "deepseek-chat")[1], &obj)
 	if _, ok := obj["reasoning_content"]; !ok {
 		t.Error("deepseek model should echo reasoning_content")
+	}
+}
+
+// A routing model whose step lands on DeepSeek thinking mode rejects an
+// assistant message without reasoning_content; the request is retried
+// with it, and later calls for that model send it from the start.
+func TestRetryWithReasoningEchoOnThinkingModeError(t *testing.T) {
+	var calls, rejected int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var req struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		for _, m := range req.Messages {
+			if _, ok := m["reasoning_content"]; m["role"] == "assistant" && !ok {
+				rejected++
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, `{"error":{"message":"The `+"`reasoning_content`"+` in the thinking mode must be passed back to the API.","type":"invalid_request_error"}}`)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	p := NewOpenAI("k", srv.URL)
+	history := []Message{
+		{Role: "user", Content: "hi"},
+		{Role: "assistant", Content: "hello"},
+		{Role: "user", Content: "again"},
+	}
+	for i := 0; i < 2; i++ {
+		resp, err := p.Chat(context.Background(), history, nil, "autojev/fast", 100, 0)
+		if err != nil || resp.Content != "ok" {
+			t.Fatalf("call %d: %v %+v", i, err, resp)
+		}
+	}
+	if rejected != 1 || calls != 3 {
+		t.Fatalf("rejected %d of %d requests, want 1 of 3", rejected, calls)
 	}
 }
