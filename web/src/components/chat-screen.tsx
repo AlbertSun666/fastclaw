@@ -5936,6 +5936,9 @@ export function WorkspacePanel({
   const [tab, setTab] = useState<"code" | "preview">("code");
   // Collapse the left file tree to give the viewer the full width.
   const [treeCollapsed, setTreeCollapsed] = useState(false);
+  // Set when the person opens the tree beside a file themselves: it then
+  // stays open on the next files until they close it again.
+  const treeKeptOpenRef = useRef(false);
   // Files the agent changed vs the template baseline (so the tree can show
   // just this task's output), and whether to show all files instead.
   const [changed, setChanged] = useState<{ files: WorkspaceFile[]; available: boolean }>({ files: [], available: false });
@@ -6174,10 +6177,11 @@ export function WorkspacePanel({
   }, [onPreviewStateChange, viewerExpanded]);
 
   // Opening a file hands the viewer the full width: the tree folds away
-  // (the header toggle brings it back) and folds again on the next file.
-  // Back in navigation mode the tree is all there is, so show it.
+  // unless the person opened it with the header toggle, in which case it
+  // stays until they close it. Back in navigation mode the tree is all
+  // there is, so show it.
   useEffect(() => {
-    setTreeCollapsed(Boolean(previewing || knowledgePreview));
+    setTreeCollapsed(Boolean(previewing || knowledgePreview) && !treeKeptOpenRef.current);
   }, [previewing, knowledgePreview]);
 
   // The Preview tab only exists for coding projects with a live dev server.
@@ -6396,7 +6400,10 @@ export function WorkspacePanel({
         <div className="flex h-10 items-center gap-0.5 border-b border-border px-4">
           {tab === "code" && viewerExpanded && (
             <button
-              onClick={() => setTreeCollapsed((c) => !c)}
+              onClick={() => {
+                treeKeptOpenRef.current = treeCollapsed;
+                setTreeCollapsed(!treeCollapsed);
+              }}
               className="-ml-1.5 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground"
               title={treeCollapsed ? tr("Show file tree", "显示文件树") : tr("Hide file tree", "隐藏文件树")}
             >
