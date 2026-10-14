@@ -258,11 +258,13 @@ func (p *parsedAgentArchive) preview() map[string]any {
 		skillNames = append(skillNames, name)
 	}
 	sort.Strings(skillNames)
+	// Lists are always arrays: nothing ignored is [], not null.
+	ignored := append([]string{}, p.Ignored...)
 	out := map[string]any{
 		"format":  "workspace",
 		"files":   files,
 		"skills":  skillNames,
-		"ignored": p.Ignored,
+		"ignored": ignored,
 	}
 	if m := p.Manifest; m != nil {
 		out["format"] = agentArchiveFormat

@@ -171,13 +171,13 @@ export default function AgentAdvancedPanel() {
             </h4>
             <p>
               <span className="text-muted-foreground">{tr("Identity files", "身份文件")}：</span>
-              {preview.files.join("、") || none}
+              {(preview.files ?? []).join("、") || none}
             </p>
             <p>
               <span className="text-muted-foreground">{tr("Skills", "技能")}：</span>
-              {preview.skills.join("、") || none}
+              {(preview.skills ?? []).join("、") || none}
             </p>
-            {preview.ignored.length > 0 && (
+            {(preview.ignored?.length ?? 0) > 0 && (
               <p className="text-xs text-muted-foreground">
                 {tr(
                   "{{n}} other files will be ignored (memory, sessions, config and anything outside identity files and skills).",

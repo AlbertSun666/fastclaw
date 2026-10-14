@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/fastclaw-ai/fastclaw/internal/config"
@@ -92,6 +93,10 @@ func TestAgentArchiveRoundTrip(t *testing.T) {
 	json.Unmarshal(preview.Body.Bytes(), &p)
 	if p.Format != "fastclaw-agent" || len(p.Files) != 1 || len(p.Skills) != 1 {
 		t.Fatalf("preview = %s", preview.Body.String())
+	}
+	// A clean export ignores nothing; the list is still an array.
+	if !strings.Contains(preview.Body.String(), `"ignored":[]`) {
+		t.Fatalf("preview ignored list = %s", preview.Body.String())
 	}
 	if _, err := os.Stat(filepath.Join(dstHome, "skills", "stale")); err != nil {
 		t.Fatal("dry run must not touch skills")
