@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -30,11 +32,30 @@ type recordingProvider struct {
 	mu       sync.Mutex
 	system   string
 	lastUser string
+	// last is every message of the latest call.
+	last []provider.Message
 	// reply overrides "pong"; onChat runs during the model call (a test
 	// stands in for the agent's tools writing files).
 	reply  string
 	onChat func()
 	usage  provider.Usage
+	// script, when set, answers the next calls in order instead (a
+	// round that calls tools, then the final answer).
+	script []provider.Response
+	// err, when set, fails every model call with it.
+	err error
+}
+
+func (p *recordingProvider) next() provider.Response {
+	p.mu.Lock()
+	if len(p.script) > 0 {
+		r := p.script[0]
+		p.script = p.script[1:]
+		p.mu.Unlock()
+		return r
+	}
+	p.mu.Unlock()
+	return provider.Response{Content: p.answer(), Usage: p.usage}
 }
 
 func (p *recordingProvider) answer() string {
@@ -68,6 +89,7 @@ func (p *recordingProvider) record(messages []provider.Message) {
 	p.mu.Lock()
 	p.system = b.String()
 	p.lastUser = lastUser
+	p.last = messages
 	p.mu.Unlock()
 }
 
@@ -79,13 +101,27 @@ func (p *recordingProvider) lastSystem() string {
 
 func (p *recordingProvider) Chat(_ context.Context, messages []provider.Message, _ []provider.Tool, _ string, _ int, _ float64) (*provider.Response, error) {
 	p.record(messages)
-	return &provider.Response{Content: p.answer(), Usage: p.usage}, nil
+	if err := p.failure(); err != nil {
+		return nil, err
+	}
+	r := p.next()
+	return &r, nil
+}
+
+func (p *recordingProvider) failure() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.err
 }
 
 func (p *recordingProvider) ChatStream(_ context.Context, messages []provider.Message, _ []provider.Tool, _ string, _ int, _ float64) (*provider.StreamReader, error) {
 	p.record(messages)
+	if err := p.failure(); err != nil {
+		return nil, err
+	}
+	r := p.next()
 	ch := make(chan provider.StreamChunk, 1)
-	ch <- provider.StreamChunk{Content: p.answer(), Done: true, Usage: p.usage}
+	ch <- provider.StreamChunk{Content: r.Content, ToolCalls: r.ToolCalls, Done: true, Usage: r.Usage, Truncated: r.Truncated}
 	close(ch)
 	return provider.NewStreamReader(ch), nil
 }
@@ -663,6 +699,58 @@ func TestStreamedChatReturnsFilesOnFinalChunk(t *testing.T) {
 	}
 }
 
+// A streamed turn relays each round's text as it comes and reports
+// every tool call starting and finishing; the text adds up to the
+// non-streamed reply.
+func TestStreamedChatReportsToolSteps(t *testing.T) {
+	h := newV1Harness(t)
+	id := h.createAgent(h.keyA, "Steps", nil)
+	h.rt.prov.mu.Lock()
+	h.rt.prov.script = []provider.Response{
+		{Content: "Looking.", ToolCalls: []provider.ToolCall{{ID: "call_1", Type: "function", Function: provider.FunctionCall{Name: "read_file", Arguments: `{"path":"missing.txt"}`}}}},
+		{Content: "Done."},
+	}
+	h.rt.prov.mu.Unlock()
+	blob, _ := json.Marshal(map[string]any{
+		"agent_id": id, "stream": true,
+		"messages": []map[string]string{{"role": "user", "content": "go"}},
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", bytes.NewReader(blob))
+	req.Header.Set("Authorization", "Bearer "+h.keyA)
+	rec := httptest.NewRecorder()
+	h.mux.ServeHTTP(rec, req)
+
+	var text strings.Builder
+	var steps []string
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if !strings.HasPrefix(line, "data: {") {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+			Tool *struct{ ID, Name, Status string } `json:"tool"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &chunk); err != nil {
+			t.Fatal(err)
+		}
+		text.WriteString(chunk.Choices[0].Delta.Content)
+		if chunk.Tool != nil {
+			steps = append(steps, chunk.Tool.ID+" "+chunk.Tool.Name+" "+chunk.Tool.Status+" after "+strconv.Quote(text.String()))
+		}
+	}
+	want := []string{`call_1 read_file running after "Looking."`, `call_1 read_file done after "Looking."`}
+	if !reflect.DeepEqual(steps, want) {
+		t.Fatalf("tool steps = %q, want %q\n%s", steps, want, rec.Body.String())
+	}
+	if text.String() != "Looking.\n\nDone." {
+		t.Fatalf("streamed text = %q\n%s", text.String(), rec.Body.String())
+	}
+}
+
 func TestMessageContentParts(t *testing.T) {
 	var msgs []chatMessage
 	err := json.Unmarshal([]byte(`[
@@ -779,9 +867,8 @@ func TestChatReportsTurnUsage(t *testing.T) {
 	if u == nil {
 		t.Fatalf("final chunk has no usage:\n%s", rec.Body.String())
 	}
-	// The streaming path decides on tool use with one call, then
-	// re-issues the answer as a stream: two billed model calls.
-	check(u, 2)
+	// Streaming runs the same loop: one model call.
+	check(u, 1)
 }
 
 func TestChatRefusedOnBillingHold(t *testing.T) {

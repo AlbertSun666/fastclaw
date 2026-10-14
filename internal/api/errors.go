@@ -23,6 +23,9 @@ const (
 	codeNotConfigured      = "not_configured"
 	codePaymentRequired    = "payment_required"
 	codeInternal           = "internal_error"
+	// codeAgentError: the agent's turn failed, e.g. its model API
+	// returned an error.
+	codeAgentError = "agent_error"
 )
 
 // writeAPIError writes the unified /v1 error body.

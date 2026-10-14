@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/fastclaw-ai/fastclaw/internal/channels"
 	"github.com/fastclaw-ai/fastclaw/internal/usage"
 )
 
@@ -221,12 +223,36 @@ type chatCompletionChunk struct {
 	// turn's model usage and the files the agent produced.
 	Usage *completionUsage `json:"usage,omitempty"`
 	Files []turnFile       `json:"files,omitempty"`
+	// Tool (FastClaw extension) reports a tool call starting or finishing
+	// while the turn runs, on a chunk whose delta is empty.
+	Tool *chunkTool `json:"tool,omitempty"`
+	// Error (FastClaw extension), on the final chunk, says the turn failed
+	// (e.g. the model API returned an error); same shape as an error body.
+	Error *apiError `json:"error,omitempty"`
 }
 
-// chunkExtras is what only the final chunk carries.
+// apiError is the /v1 error object (see writeAPIError).
+type apiError struct {
+	Type    string `json:"type"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// chunkTool is one step of the turn: the tool call's id, the tool's name
+// and "running" or "done".
+type chunkTool struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Status string `json:"status"`
+}
+
+// chunkExtras is what only some chunks carry: usage and files on the
+// final one, a tool step on its own.
 type chunkExtras struct {
 	Usage *completionUsage
 	Files []turnFile
+	Tool  *chunkTool
+	Error *apiError
 }
 
 type chunkChoice struct {
@@ -462,12 +488,70 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if isStream {
 		s.streamResponseFromAgent(w, r, ag, msg, chatID, model, now, files, collector)
 	} else {
-		// Get reply from agent
-		reply := ag.HandleMessage(r.Context(), msg)
+		var turnErr string
+		reply := runAgentTurn(r.Context(), ag, msg, func(evt agent.ChatEvent) {
+			if evt.Type == "error" {
+				turnErr = eventMessage(evt)
+			}
+		}, nil)
+		if turnErr != "" {
+			writeAPIError(w, http.StatusBadGateway, errTypeServer, codeAgentError, turnErr)
+			return
+		}
 		s.fullResponse(w, reply, chatID, model, now, files(reply), usageFromCollector(collector))
 	}
 }
 
+// runAgentTurn runs one agent turn (HandleMessage, the loop the web chat
+// and every channel use) and hands each event it emits to onEvent while it
+// runs; onIdle, when set, is called every 15s. It returns the reply, its
+// separate messages joined by blank lines.
+func runAgentTurn(ctx context.Context, ag *agent.Agent, msg bus.InboundMessage, onEvent func(agent.ChatEvent), onIdle func()) string {
+	events := make(chan agent.ChatEvent, 256)
+	ctx = agent.ContextWithStream(ctx, events, nil, nil, "", ag.Name(), "")
+	replyCh := make(chan string, 1)
+	go func() { replyCh <- apiReplyText(ag.HandleMessage(ctx, msg)) }()
+
+	tick := time.NewTicker(15 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case evt := <-events:
+			onEvent(evt)
+		case <-tick.C:
+			if onIdle != nil {
+				onIdle()
+			}
+		case reply := <-replyCh:
+			// Events are sent before HandleMessage returns; take what's
+			// still buffered.
+			for {
+				select {
+				case evt := <-events:
+					onEvent(evt)
+				default:
+					return reply
+				}
+			}
+		}
+	}
+}
+
+// eventMessage is an error event's message.
+func eventMessage(evt agent.ChatEvent) string {
+	if m, _ := evt.Data["message"].(string); m != "" {
+		return m
+	}
+	return "the agent failed to answer"
+}
+
+// streamResponseFromAgent runs the same agent loop as the non-streaming
+// path and the web chat (HandleMessage) and relays its events as OpenAI
+// SSE chunks while the turn runs: every round's text as delta.content
+// (rounds joined by a blank line, the way the full reply joins them) and,
+// as a FastClaw extension, each tool call as a top-level `tool` object on
+// a chunk with an empty delta — once when it starts and once when it
+// finishes. The final chunk carries usage and files.
 func (s *Server) streamResponseFromAgent(w http.ResponseWriter, r *http.Request, ag *agent.Agent, msg bus.InboundMessage, chatID, model string, created int64, files func(reply string) []turnFile, collector *usage.Collector) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -475,40 +559,93 @@ func (s *Server) streamResponseFromAgent(w http.ResponseWriter, r *http.Request,
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(http.StatusOK)
 
-	flusher, ok := w.(http.Flusher)
+	flusher, _ := w.(http.Flusher)
+	flush := func() {
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
 
-	sr := ag.HandleMessageStream(r.Context(), msg)
-	var reply strings.Builder
-
-	// Send role chunk
 	s.writeSSEChunk(w, chatID, model, created, "assistant", "", nil, nil)
-	if ok {
-		flusher.Flush()
-	}
+	flush()
 
-	// Forward chunks from StreamReader
-	for {
-		chunk, more := sr.Next()
-		if chunk.Content != "" {
-			reply.WriteString(chunk.Content)
-			s.writeSSEChunk(w, chatID, model, created, "", chunk.Content, nil, nil)
-			if ok {
-				flusher.Flush()
+	var streamed strings.Builder
+	roundOpen := false // text of the current model round has been sent
+	writeText := func(text string) {
+		if text == "" {
+			return
+		}
+		if !roundOpen && streamed.Len() > 0 {
+			text = "\n\n" + text
+		}
+		roundOpen = true
+		streamed.WriteString(text)
+		s.writeSSEChunk(w, chatID, model, created, "", text, nil, nil)
+		flush()
+	}
+	var turnErr string
+	handle := func(evt agent.ChatEvent) {
+		switch evt.Type {
+		case "error":
+			turnErr = eventMessage(evt)
+		case "content_delta":
+			if d, _ := evt.Data["delta"].(string); d != "" {
+				writeText(d)
 			}
-		}
-		if chunk.Done || !more {
-			break
+		case "content":
+			// The round's full text; already relayed when it streamed.
+			if c, _ := evt.Data["content"].(string); !roundOpen && strings.TrimSpace(c) != "" {
+				writeText(apiReplyText(c))
+			}
+			roundOpen = false
+		case "tool_call", "tool_result":
+			id, _ := evt.Data["id"].(string)
+			name, _ := evt.Data["name"].(string)
+			status := "running"
+			if evt.Type == "tool_result" {
+				status = "done"
+			}
+			roundOpen = false
+			s.writeSSEChunk(w, chatID, model, created, "", "", nil, &chunkExtras{Tool: &chunkTool{ID: id, Name: name, Status: status}})
+			flush()
 		}
 	}
 
-	// Send finish chunk
+	// Heartbeat comments keep proxies from closing a connection that is
+	// quiet while a long tool runs.
+	reply := runAgentTurn(r.Context(), ag, msg, handle, func() {
+		fmt.Fprint(w, ": ping\n\n")
+		flush()
+	})
 	done := "stop"
 	u := usageFromCollector(collector)
-	s.writeSSEChunk(w, chatID, model, created, "", "", &done, &chunkExtras{Usage: &u, Files: files(reply.String())})
-	fmt.Fprint(w, "data: [DONE]\n\n")
-	if ok {
-		flusher.Flush()
+	if turnErr != "" {
+		// The reply is then an apology around the error; the caller gets
+		// the error itself instead.
+		s.writeSSEChunk(w, chatID, model, created, "", "", &done, &chunkExtras{Usage: &u, Error: &apiError{Type: errTypeServer, Code: codeAgentError, Message: turnErr}})
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		flush()
+		return
 	}
+	// Text the events didn't carry, e.g. a slash command's answer.
+	if rest, ok := strings.CutPrefix(reply, streamed.String()); ok {
+		if rest != "" {
+			streamed.WriteString(rest)
+			s.writeSSEChunk(w, chatID, model, created, "", rest, nil, nil)
+		}
+	} else if streamed.Len() == 0 {
+		s.writeSSEChunk(w, chatID, model, created, "", reply, nil, nil)
+	}
+
+	s.writeSSEChunk(w, chatID, model, created, "", "", &done, &chunkExtras{Usage: &u, Files: files(reply)})
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	flush()
+}
+
+// apiReplyText joins the reply's separate messages with blank lines: the
+// split marker is for chat channels that send them as separate bubbles.
+func apiReplyText(reply string) string {
+	return strings.ReplaceAll(reply, channels.SplitMessageMarker, "\n\n")
 }
 
 func (s *Server) writeSSEChunk(w http.ResponseWriter, id, model string, created int64, role, content string, finishReason *string, extras *chunkExtras) {
@@ -531,6 +668,8 @@ func (s *Server) writeSSEChunk(w http.ResponseWriter, id, model string, created 
 	if extras != nil {
 		chunk.Usage = extras.Usage
 		chunk.Files = extras.Files
+		chunk.Tool = extras.Tool
+		chunk.Error = extras.Error
 	}
 	data, _ := json.Marshal(chunk)
 	fmt.Fprintf(w, "data: %s\n\n", data)

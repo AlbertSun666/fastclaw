@@ -194,6 +194,24 @@ non-streaming returns an OpenAI `chat.completion` (`choices[0].message.content`)
 The request's `model` field doesn't change the agent's model — the agent's
 configuration decides it.
 
+A stream follows the turn as it runs: the agent's text arrives while it is
+written, including what it says between steps, and each tool call is
+reported on a chunk with an empty delta, once when it starts and once when
+it finishes:
+`data: {"choices":[{"delta":{}}],"tool":{"id":"call_1","name":"exec","status":"running"}}`
+(`status` then `done`). `name` is the agent's tool (`exec`, `load_skill`,
+`read_file`, …), so show it as a progress step in your own words. The
+streamed text adds up to the non-streaming reply; separate messages in a
+reply are joined by a blank line.
+
+A turn that fails — the agent's model API returns an error, or the model
+gives no usable answer — is an error, not a reply: non-streaming answers
+`502` with `{"error": {"type": "server_error", "code": "agent_error",
+"message": "..."}}`; a stream (already `200`) ends with that `error` object
+on its final chunk instead of `files`. Treat either as "nothing was
+produced": don't charge for it, let the user retry, and show `message`
+only in details — it is the upstream error, not text for end-users.
+
 `usage` (non-streaming: top level; streaming: on the final chunk) sums every
 model call the agent made for this turn, tool loops included:
 `prompt_tokens` / `completion_tokens` / `total_tokens` as in OpenAI
