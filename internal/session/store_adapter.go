@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/provider"
@@ -16,9 +17,10 @@ import (
 // scoping is implicit at the call site instead of getting plumbed through
 // every agent loop call.
 type StoreAdapter struct {
-	st             store.Store
-	userID         string
-	ownerCache     map[string]string // sessionKey → resolved owner userID
+	st         store.Store
+	userID     string
+	ownerMu    sync.Mutex
+	ownerCache map[string]string // sessionKey → resolved owner userID
 }
 
 func NewStoreAdapter(st store.Store, userID string) *StoreAdapter {
@@ -32,29 +34,40 @@ func NewStoreAdapter(st store.Store, userID string) *StoreAdapter {
 // session_key on a shared/public agent cannot read another user's chat.
 func (a *StoreAdapter) resolveSessionOwner(ctx context.Context, agentID, sessionKey string) string {
 	// Check cache first to avoid repeated DB lookups for the same session.
-	if a.ownerCache != nil {
-		if cached, ok := a.ownerCache[sessionKey]; ok {
-			return cached
-		}
+	a.ownerMu.Lock()
+	cached, ok := a.ownerCache[sessionKey]
+	a.ownerMu.Unlock()
+	if ok {
+		return cached
+	}
+	owner, err := a.st.LookupSessionOwner(ctx, agentID, sessionKey)
+	if err != nil || owner == "" {
+		// No row yet (a chat about to be created) or a failed lookup (e.g.
+		// a busy database): answer self/deny for now, but don't remember
+		// it — a cached failure would hide a real session until restart.
+		return a.userID
 	}
 	result := a.userID // default: deny / self
-	owner, err := a.st.LookupSessionOwner(ctx, agentID, sessionKey)
-	if err == nil && owner != "" {
-		if owner == a.userID {
+	if owner == a.userID {
+		result = owner
+	} else {
+		// Check if the owner is a child of the caller (app_user whose
+		// owner_user_id == a.userID). If not, deny by returning a.userID
+		// so the downstream query simply returns no rows.
+		u, err := a.st.GetUser(ctx, owner)
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return a.userID
+		}
+		if u != nil && u.OwnerUserID == a.userID {
 			result = owner
-		} else {
-			// Check if the owner is a child of the caller (app_user whose
-			// owner_user_id == a.userID). If not, deny by returning a.userID
-			// so the downstream query simply returns no rows.
-			if u, err := a.st.GetUser(ctx, owner); err == nil && u != nil && u.OwnerUserID == a.userID {
-				result = owner
-			}
 		}
 	}
+	a.ownerMu.Lock()
 	if a.ownerCache == nil {
 		a.ownerCache = make(map[string]string)
 	}
 	a.ownerCache[sessionKey] = result
+	a.ownerMu.Unlock()
 	return result
 }
 
